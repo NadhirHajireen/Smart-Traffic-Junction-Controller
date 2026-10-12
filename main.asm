@@ -6,6 +6,10 @@
 ; LDR LIGHT / DARK CONTROL
 ;
 ; CLOCK = 16 MHz
+;
+; PIN CHANGES IN THIS VERSION:
+;   Button     : PD0 (D0)  -> PD7 (D7)
+;   M1 RED LED : PD1 (D1)  -> PB5 (D13)
 ;=========================================================
 
 
@@ -18,16 +22,17 @@
 ; PB2 = LED 3
 ; PB3 = LED 4
 ; PB4 = LED 5
+; PB5 = MODULE 1 RED   (D13)   <-- moved here (shares PORTB with the 5 LEDs)
 
 
 ;=========================================================
 ; PORT D
 ;=========================================================
 
-; PD0 = PUSH BUTTON
+; PD7 = PUSH BUTTON (D7)       <-- moved here
 
 ; MODULE 1:
-; PD1 = RED
+; PB5 = RED   (see PORT B)
 ; PD2 = YELLOW
 ; PD3 = GREEN
 
@@ -35,6 +40,8 @@
 ; PD4 = RED
 ; PD5 = YELLOW
 ; PD6 = GREEN
+
+; PD0 / PD1 = unused (UART RX/TX, left as inputs)
 
 
 ;=========================================================
@@ -63,10 +70,12 @@
 ; NORMAL TRAFFIC:
 ;=========================================================
 
-; M1 GREEN / M2 RED       10 sec
-; M1 YELLOW / M2 YELLOW   3 sec
-; M1 RED / M2 GREEN       10 sec
-; M1 YELLOW / M2 YELLOW   3 sec
+; M1 GREEN  / M2 RED      10 sec
+; M1 YELLOW / M2 RED      3 sec   (M1 stops)
+; M1 RED    / M2 YELLOW   3 sec   (M2 gets ready)
+; M1 RED    / M2 GREEN    10 sec
+; M1 RED    / M2 YELLOW   3 sec   (M2 stops)
+; M1 YELLOW / M2 RED      3 sec   (M1 gets ready)
 ; repeat
 
 
@@ -77,11 +86,8 @@
 ; M1 YELLOW / M2 YELLOW
 ; Yellow LEDs blink.
 ;
-; If button pressed during dark mode:
-;
-; M1 RED / M2 RED
-; LED sequence = 5 seconds
-; then return to dark mode.
+; The push button is IGNORED during dark mode.
+; Any press made in the dark is discarded when light returns.
 
 
 ;=========================================================
@@ -115,12 +121,43 @@
 
 
 ;=========================================================
+; MACROS FOR MODULE 1 RED (now on PB5)
+;
+; PB5 lives on PORTB together with the 5 sequence LEDs,
+; so it must NEVER be changed with a whole-port write.
+; These macros touch only the PB5 bit.
+;=========================================================
+
+.macro M1_RED_ON
+    sbi PORTB, PB5
+.endmacro
+
+.macro M1_RED_OFF
+    cbi PORTB, PB5
+.endmacro
+
+
+;=========================================================
 ; RESET VECTOR
 ;=========================================================
 
 .org 0x0000
 
     rjmp RESET
+
+
+;---------------------------------------------------------
+; Pin-change interrupt vector (PCINT16-23 = PORT D)
+;---------------------------------------------------------
+
+.org PCI2addr
+
+    rjmp PCINT2_ISR
+
+
+; Main program starts after the vector table
+
+.org INT_VECTORS_SIZE
 
 
 ;=========================================================
@@ -130,13 +167,14 @@
 ; r16 = general purpose
 ; r17 = traffic timer
 ; r18 = LED timer/counter
-; r19 = button request flag
+; r19 = button request flag (latched by the PD7 interrupt)
 ; r20 = delay counter
 ; r21 = delay counter
 ; r22 = delay counter
 ; r23 = button source
 ; r24 = ADC value
 ; r25 = light status
+; r26 = scratch for LED_WRITE (new)
 
 ; r19:
 ;   0 = no button request
@@ -172,12 +210,13 @@ RESET:
     ; PORT B
     ;=====================================================
 
-    ; PB0-PB4 OUTPUT
+    ; PB0-PB4 = 5 LEDs (OUTPUT)
+    ; PB5     = M1 RED (OUTPUT)
 
-    ldi r16, 0b00011111
+    ldi r16, 0b00111111
     out DDRB, r16
 
-    ; LEDs OFF
+    ; All outputs OFF
 
     ldi r16, 0
     out PORTB, r16
@@ -187,18 +226,46 @@ RESET:
     ; PORT D
     ;=====================================================
 
-    ; PD0 = INPUT
-    ; PD1-PD6 = OUTPUT
+    ; PD0, PD1 = unused (input)
+    ; PD2-PD6  = OUTPUT (M1 yellow/green, M2 R/Y/G)
+    ; PD7      = INPUT  (push button)
 
-    ldi r16, 0b01111110
+    ldi r16, 0b01111100
     out DDRD, r16
 
+    ; Outputs OFF, PD7 pull-up ON (set below)
+
+    ldi r16, 0
+    out PORTD, r16
+
 
     ;-----------------------------------------------------
-    ; Enable internal pull-up on push button
+    ; Enable internal pull-up on push button (PD7)
+    ;
+    ; Wiring: button between D7 and GND
     ;-----------------------------------------------------
 
-    sbi PORTD, PD0
+    sbi PORTD, PD7
+
+
+    ;-----------------------------------------------------
+    ; Pin-change interrupt on PD7 (PCINT23)
+    ;
+    ; A button press is LATCHED by the interrupt, so it is
+    ; never missed while the program sits in a delay, and
+    ; the program never has to wait for the release.
+    ;-----------------------------------------------------
+
+    ldi r16, (1<<PCINT23)
+    sts PCMSK2, r16
+
+    ldi r16, (1<<PCIE2)
+    sts PCICR, r16
+
+    ; Clear any pending flag
+
+    ldi r16, (1<<PCIF2)
+    out PCIFR, r16
 
 
     ;=====================================================
@@ -253,6 +320,10 @@ RESET:
     ldi r19, 0
     ldi r23, 0
     ldi r25, 1
+
+    ; Enable interrupts
+
+    sei
 
 
     ;=====================================================
@@ -311,7 +382,7 @@ DARK_MODE:
     ; M1 YELLOW
     ;-----------------------------------------------------
 
-    cbi PORTD, PD1
+    M1_RED_OFF
     sbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -326,11 +397,10 @@ DARK_MODE:
 
 
     ;-----------------------------------------------------
-    ; LEDs OFF
+    ; 5 LEDs OFF (M1 RED on PB5 is preserved)
     ;-----------------------------------------------------
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ;-----------------------------------------------------
@@ -342,18 +412,7 @@ DARK_MODE:
 
 DARK_YELLOW_ON_LOOP:
 
-    rcall CHECK_BUTTON_DARK
-
-    tst r19
-
-    ; If no button, continue.
-    breq DARK_NO_BUTTON_ON
-
-    ; Button pressed.
-    rjmp DARK_BUTTON
-
-
-DARK_NO_BUTTON_ON:
+    ; Push button is IGNORED in dark mode.
 
     rcall DELAY_100MS
 
@@ -392,16 +451,7 @@ DARK_NO_BUTTON_ON:
 
 DARK_YELLOW_OFF_LOOP:
 
-    rcall CHECK_BUTTON_DARK
-
-    tst r19
-
-    breq DARK_NO_BUTTON_OFF
-
-    rjmp DARK_BUTTON
-
-
-DARK_NO_BUTTON_OFF:
+    ; Push button is IGNORED in dark mode.
 
     rcall DELAY_100MS
 
@@ -449,17 +499,6 @@ DARK_LIGHT_RETURNED_2:
 
 
 ;=========================================================
-; BUTTON DURING DARK MODE
-;=========================================================
-
-DARK_BUTTON:
-
-    ldi r19, 0
-
-    rjmp BOTH_RED_DARK
-
-
-;=========================================================
 ;=========================================================
 ; NORMAL TRAFFIC
 ;
@@ -485,18 +524,17 @@ M1_GREEN_M2_RED:
 M1_GREEN_LIGHT_OK:
 
     ;-----------------------------------------------------
-    ; LEDs OFF
+    ; 5 LEDs OFF
     ;-----------------------------------------------------
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ;-----------------------------------------------------
     ; M1 GREEN
     ;-----------------------------------------------------
 
-    cbi PORTD, PD1
+    M1_RED_OFF
     cbi PORTD, PD2
     sbi PORTD, PD3
 
@@ -529,8 +567,6 @@ M1_GREEN_LOOP:
 
 M1_GREEN_STILL_LIGHT:
 
-    rcall CHECK_BUTTON
-
     tst r19
     breq M1_GREEN_NO_BUTTON
 
@@ -557,7 +593,7 @@ M1_GREEN_NO_BUTTON:
 
 M1_GREEN_NO_REQUEST:
 
-    rjmp BOTH_YELLOW_FROM_M1
+    rjmp STOP_M1
 
 
 ;=========================================================
@@ -571,26 +607,82 @@ M1_GREEN_BUTTON:
 
 ;=========================================================
 ;=========================================================
-; BOTH YELLOW AFTER M1 GREEN
+; M1 STOPPING SEQUENCE (after M1 green)
+; 
+; M1 YELLOW / M2 RED  -> M1 RED / M2 YELLOW -> M2 green
 ;=========================================================
 ;=========================================================
 
-BOTH_YELLOW_FROM_M1:
+STOP_M1:
 
     rcall CHECK_LIGHT
 
     tst r25
-    brne BOTH_YELLOW_M1_LIGHT
+    brne STOP_M1_LIGHT
 
     rjmp DARK_MODE
 
 
-BOTH_YELLOW_M1_LIGHT:
+STOP_M1_LIGHT:
 
     ; M1 YELLOW
 
-    cbi PORTD, PD1
+    M1_RED_OFF
     sbi PORTD, PD2
+    cbi PORTD, PD3
+
+
+    ; M2 RED
+
+    sbi PORTD, PD4
+    cbi PORTD, PD5
+    cbi PORTD, PD6
+
+
+    ;-----------------------------------------------------
+    ; 3 seconds
+    ;-----------------------------------------------------
+
+    ldi r17, 30
+
+
+STOP_M1_LOOP:
+
+    rcall CHECK_LIGHT
+
+    tst r25
+    brne STOP_M1_CONT
+
+    rjmp DARK_MODE
+
+
+STOP_M1_CONT:
+
+    rcall DELAY_100MS
+
+    dec r17
+    brne STOP_M1_LOOP
+
+
+    rjmp PREP_M2
+
+
+PREP_M2:
+
+    rcall CHECK_LIGHT
+
+    tst r25
+    brne PREP_M2_LIGHT
+
+    rjmp DARK_MODE
+
+
+PREP_M2_LIGHT:
+
+    ; M1 RED
+
+    M1_RED_ON
+    cbi PORTD, PD2
     cbi PORTD, PD3
 
 
@@ -608,22 +700,22 @@ BOTH_YELLOW_M1_LIGHT:
     ldi r17, 30
 
 
-BOTH_YELLOW_FROM_M1_LOOP:
+PREP_M2_LOOP:
 
     rcall CHECK_LIGHT
 
     tst r25
-    brne BOTH_YELLOW_M1_CONTINUE
+    brne PREP_M2_CONT
 
     rjmp DARK_MODE
 
 
-BOTH_YELLOW_M1_CONTINUE:
+PREP_M2_CONT:
 
     rcall DELAY_100MS
 
     dec r17
-    brne BOTH_YELLOW_FROM_M1_LOOP
+    brne PREP_M2_LOOP
 
 
     rjmp M1_RED_M2_GREEN
@@ -648,15 +740,14 @@ M1_YELLOW_M2_RED_REQUEST:
 
 M1_YELLOW_REQUEST_LIGHT:
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 YELLOW
 
-    cbi PORTD, PD1
+    M1_RED_OFF
     sbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -714,15 +805,14 @@ M1_RED_M2_GREEN:
 
 M2_GREEN_LIGHT_OK:
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 RED
 
-    sbi PORTD, PD1
+    M1_RED_ON
     cbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -753,8 +843,6 @@ M2_GREEN_LOOP:
 
 M2_GREEN_STILL_LIGHT:
 
-    rcall CHECK_BUTTON
-
     tst r19
     breq M2_GREEN_NO_BUTTON
 
@@ -777,7 +865,7 @@ M2_GREEN_NO_BUTTON:
 
 M2_GREEN_NO_REQUEST:
 
-    rjmp BOTH_YELLOW_FROM_M2
+    rjmp STOP_M2
 
 
 ;=========================================================
@@ -791,26 +879,28 @@ M2_GREEN_BUTTON:
 
 ;=========================================================
 ;=========================================================
-; BOTH YELLOW AFTER M2 GREEN
+; M2 STOPPING SEQUENCE (after M2 green)
+; 
+; M2 YELLOW / M1 RED  -> M2 RED / M1 YELLOW -> M1 green
 ;=========================================================
 ;=========================================================
 
-BOTH_YELLOW_FROM_M2:
+STOP_M2:
 
     rcall CHECK_LIGHT
 
     tst r25
-    brne BOTH_YELLOW_M2_LIGHT
+    brne STOP_M2_LIGHT
 
     rjmp DARK_MODE
 
 
-BOTH_YELLOW_M2_LIGHT:
+STOP_M2_LIGHT:
 
-    ; M1 YELLOW
+    ; M1 RED
 
-    cbi PORTD, PD1
-    sbi PORTD, PD2
+    M1_RED_ON
+    cbi PORTD, PD2
     cbi PORTD, PD3
 
 
@@ -828,22 +918,76 @@ BOTH_YELLOW_M2_LIGHT:
     ldi r17, 30
 
 
-BOTH_YELLOW_FROM_M2_LOOP:
+STOP_M2_LOOP:
 
     rcall CHECK_LIGHT
 
     tst r25
-    brne BOTH_YELLOW_M2_CONTINUE
+    brne STOP_M2_CONT
 
     rjmp DARK_MODE
 
 
-BOTH_YELLOW_M2_CONTINUE:
+STOP_M2_CONT:
 
     rcall DELAY_100MS
 
     dec r17
-    brne BOTH_YELLOW_FROM_M2_LOOP
+    brne STOP_M2_LOOP
+
+
+    rjmp PREP_M1
+
+
+PREP_M1:
+
+    rcall CHECK_LIGHT
+
+    tst r25
+    brne PREP_M1_LIGHT
+
+    rjmp DARK_MODE
+
+
+PREP_M1_LIGHT:
+
+    ; M1 YELLOW
+
+    M1_RED_OFF
+    sbi PORTD, PD2
+    cbi PORTD, PD3
+
+
+    ; M2 RED
+
+    sbi PORTD, PD4
+    cbi PORTD, PD5
+    cbi PORTD, PD6
+
+
+    ;-----------------------------------------------------
+    ; 3 seconds
+    ;-----------------------------------------------------
+
+    ldi r17, 30
+
+
+PREP_M1_LOOP:
+
+    rcall CHECK_LIGHT
+
+    tst r25
+    brne PREP_M1_CONT
+
+    rjmp DARK_MODE
+
+
+PREP_M1_CONT:
+
+    rcall DELAY_100MS
+
+    dec r17
+    brne PREP_M1_LOOP
 
 
     rjmp M1_GREEN_M2_RED
@@ -868,15 +1012,14 @@ M1_RED_M2_YELLOW_REQUEST:
 
 M2_YELLOW_REQUEST_LIGHT:
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 RED
 
-    sbi PORTD, PD1
+    M1_RED_ON
     cbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -928,7 +1071,7 @@ BOTH_RED:
 
     ; M1 RED
 
-    sbi PORTD, PD1
+    M1_RED_ON
     cbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -940,10 +1083,9 @@ BOTH_RED:
     cbi PORTD, PD6
 
 
-    ; LEDs OFF
+    ; 5 LEDs OFF (M1 RED on PB5 stays ON)
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ;-----------------------------------------------------
@@ -953,10 +1095,9 @@ BOTH_RED:
     rcall LED_SEQUENCE
 
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ;-----------------------------------------------------
@@ -990,74 +1131,6 @@ BUTTON_SOURCE_ERROR:
 
 ;=========================================================
 ;=========================================================
-; BOTH RED FROM DARK MODE
-;=========================================================
-;=========================================================
-
-BOTH_RED_DARK:
-
-    ;-----------------------------------------------------
-    ; M1 RED
-    ;-----------------------------------------------------
-
-    sbi PORTD, PD1
-    cbi PORTD, PD2
-    cbi PORTD, PD3
-
-
-    ;-----------------------------------------------------
-    ; M2 RED
-    ;-----------------------------------------------------
-
-    sbi PORTD, PD4
-    cbi PORTD, PD5
-    cbi PORTD, PD6
-
-
-    ; LEDs OFF
-
-    ldi r16, 0
-    out PORTB, r16
-
-
-    ;-----------------------------------------------------
-    ; 5-second LED sequence
-    ;-----------------------------------------------------
-
-    rcall LED_SEQUENCE
-
-
-    ; LEDs OFF
-
-    ldi r16, 0
-    out PORTB, r16
-
-
-    ; Clear button
-
-    ldi r19, 0
-    ldi r23, 0
-
-
-    ;-----------------------------------------------------
-    ; Check light
-    ;-----------------------------------------------------
-
-    rcall CHECK_LIGHT
-
-    tst r25
-    brne DARK_BUTTON_LIGHT_RETURNED
-
-    rjmp DARK_MODE
-
-
-DARK_BUTTON_LIGHT_RETURNED:
-
-    rjmp M1_GREEN_M2_RED
-
-
-;=========================================================
-;=========================================================
 ; BUTTON FROM M1 GREEN
 ;=========================================================
 ;=========================================================
@@ -1068,15 +1141,14 @@ BUTTON_FROM_M1:
     ldi r23, 0
 
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 RED
 
-    sbi PORTD, PD1
+    M1_RED_ON
     cbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -1132,15 +1204,14 @@ BUTTON_M2_GREEN:
 
 BUTTON_M2_GREEN_LIGHT:
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 RED
 
-    sbi PORTD, PD1
+    M1_RED_ON
     cbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -1177,7 +1248,7 @@ BUTTON_M2_GREEN_CONTINUE:
     brne BUTTON_M2_GREEN_LOOP
 
 
-    rjmp BOTH_YELLOW_FROM_M2
+    rjmp STOP_M2
 
 
 ;=========================================================
@@ -1192,15 +1263,14 @@ BUTTON_FROM_M2:
     ldi r23, 0
 
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 YELLOW
 
-    cbi PORTD, PD1
+    M1_RED_OFF
     sbi PORTD, PD2
     cbi PORTD, PD3
 
@@ -1256,15 +1326,14 @@ BUTTON_M1_GREEN:
 
 BUTTON_M1_GREEN_LIGHT:
 
-    ; LEDs OFF
+    ; 5 LEDs OFF
 
-    ldi r16, 0
-    out PORTB, r16
+    rcall LEDS_OFF
 
 
     ; M1 GREEN
 
-    cbi PORTD, PD1
+    M1_RED_OFF
     cbi PORTD, PD2
     sbi PORTD, PD3
 
@@ -1301,113 +1370,36 @@ BUTTON_M1_GREEN_CONTINUE:
     brne BUTTON_M1_GREEN_LOOP
 
 
-    rjmp BOTH_YELLOW_FROM_M1
+    rjmp STOP_M1
 
 
 ;=========================================================
 ;=========================================================
-; CHECK BUTTON
-;=========================================================
-
-; PD0:
+; BUTTON INTERRUPT  (PD7 pin change)
 ;
-; HIGH = NOT PRESSED
-; LOW  = PRESSED
+; Runs on every change of PD7.
+;   pin LOW  (pressed)  -> latch r19 = 1
+;   pin HIGH (released) -> ignored
 ;
-;=========================================================
-
-CHECK_BUTTON:
-
-    ;-----------------------------------------------------
-    ; Check button
-    ;-----------------------------------------------------
-
-    sbic PIND, PD0
-    rjmp BUTTON_EXIT
-
-
-    ;-----------------------------------------------------
-    ; Debounce
-    ;-----------------------------------------------------
-
-    rcall DELAY_20MS
-
-
-    ;-----------------------------------------------------
-    ; Check again
-    ;-----------------------------------------------------
-
-    sbic PIND, PD0
-    rjmp BUTTON_EXIT
-
-
-    ;-----------------------------------------------------
-    ; Button confirmed
-    ;-----------------------------------------------------
-
-    ldi r19, 1
-
-
-    ;-----------------------------------------------------
-    ; Wait for release
-    ;-----------------------------------------------------
-
-BUTTON_RELEASE:
-
-    sbis PIND, PD0
-    rjmp BUTTON_RELEASE
-
-
-    ; Release debounce
-
-    rcall DELAY_20MS
-
-
-BUTTON_EXIT:
-
-    ret
-
-
-;=========================================================
-;=========================================================
-; CHECK BUTTON DURING DARK MODE
+; r19 stays 1 until the main program clears it.
+; Contact bounce only re-latches the same flag.
+;
+; Only SBIC / RJMP / LDI are used. None of them change
+; SREG, so nothing has to be saved.
 ;=========================================================
 ;=========================================================
 
-CHECK_BUTTON_DARK:
+PCINT2_ISR:
 
-    sbic PIND, PD0
-    rjmp DARK_BUTTON_EXIT
+    sbic PIND, PD7        ; skip next line if pin is LOW (pressed)
+    rjmp PCINT2_EXIT      ; pin HIGH -> ignore
 
-
-    ; Debounce
-
-    rcall DELAY_20MS
+    ldi r19, 1            ; latch button request
 
 
-    ; Check again
+PCINT2_EXIT:
 
-    sbic PIND, PD0
-    rjmp DARK_BUTTON_EXIT
-
-
-    ; Button confirmed
-
-    ldi r19, 1
-
-
-DARK_BUTTON_RELEASE:
-
-    sbis PIND, PD0
-    rjmp DARK_BUTTON_RELEASE
-
-
-    rcall DELAY_20MS
-
-
-DARK_BUTTON_EXIT:
-
-    ret
+    reti
 
 
 ;=========================================================
@@ -1494,6 +1486,39 @@ ADC_DARK:
 
 ;=========================================================
 ;=========================================================
+; LED_WRITE / LEDS_OFF   (NEW)
+;
+; The 5 sequence LEDs (PB0-PB4) share PORTB with
+; M1 RED (PB5). A plain "out PORTB, x" would switch
+; PB5 off, so these routines only change PB0-PB4.
+;
+; LED_WRITE : r16 bits 0-4 = new LED pattern
+;             PB5-PB7 are left untouched
+; LEDS_OFF  : turns PB0-PB4 off, PB5 untouched
+;
+; Uses r16 and r26.
+;=========================================================
+;=========================================================
+
+LED_WRITE:
+
+    andi r16, 0b00011111      ; keep only the LED bits
+    in   r26, PORTB
+    andi r26, 0b11100000      ; keep PB5-PB7 as they are
+    or   r26, r16             ; merge new LED pattern
+    out  PORTB, r26
+
+    ret
+
+
+LEDS_OFF:
+
+    ldi r16, 0
+    rjmp LED_WRITE            ; LED_WRITE returns to our caller
+
+
+;=========================================================
+;=========================================================
 ; LED SEQUENCE
 ;
 ; 1 sec = 5 LEDs
@@ -1504,68 +1529,40 @@ ADC_DARK:
 ;
 ; Total = 5 seconds
 ;
+; M1 RED (PB5) is not affected.
+;
 ;=========================================================
 ;=========================================================
 
 LED_SEQUENCE:
 
-    ;=====================================================
-    ; 1 SECOND - 5 LEDs
-    ;=====================================================
-
+    ; Stage 1: LEDs 1-5 ON
     ldi r16, 0b00011111
-    out PORTB, r16
-
+    rcall LED_WRITE
     rcall DELAY_1SEC
 
-
-    ;=====================================================
-    ; 2 SECOND - 4 LEDs
-    ;=====================================================
-
+    ; Stage 2: LEDs 1-4 ON
     ldi r16, 0b00001111
-    out PORTB, r16
-
+    rcall LED_WRITE
     rcall DELAY_1SEC
 
-
-    ;=====================================================
-    ; 3 SECOND - 3 LEDs
-    ;=====================================================
-
+    ; Stage 3: LEDs 1-3 ON
     ldi r16, 0b00000111
-    out PORTB, r16
-
+    rcall LED_WRITE
     rcall DELAY_1SEC
 
-
-    ;=====================================================
-    ; 4 SECOND - 2 LEDs
-    ;=====================================================
-
+    ; Stage 4: LEDs 1-2 ON
     ldi r16, 0b00000011
-    out PORTB, r16
-
+    rcall LED_WRITE
     rcall DELAY_1SEC
 
-
-    ;=====================================================
-    ; 5 SECOND - 1 LED
-    ;=====================================================
-
+    ; Stage 5: LED 1 ON
     ldi r16, 0b00000001
-    out PORTB, r16
-
+    rcall LED_WRITE
     rcall DELAY_1SEC
 
-
-    ;-----------------------------------------------------
-    ; LEDs OFF
-    ;-----------------------------------------------------
-
-    ldi r16, 0
-    out PORTB, r16
-
+    ; All 5 LEDs OFF
+    rcall LEDS_OFF
     ret
 
 
@@ -1602,17 +1599,23 @@ DELAY_1SEC_LOOP:
 
 DELAY_100MS:
 
-    ldi r20, 8
+    ; Cycle count (16 MHz, 1 cycle = 62.5 ns):
+    ;   inner  loop (132) = 131*3 + 2   =     395 cycles
+    ;   middle loop (250) = 249*399 + 398 = 99,749 cycles
+    ;   outer  loop (16)  = ~1,596,047 cycles
+    ;   total             = ~99.75 ms
+
+    ldi r20, 16
 
 
 DELAY100_OUTER:
 
-    ldi r21, 200
+    ldi r21, 250
 
 
 DELAY100_MIDDLE:
 
-    ldi r22, 250
+    ldi r22, 132
 
 
 DELAY100_INNER:
@@ -1625,41 +1628,6 @@ DELAY100_INNER:
 
     dec r20
     brne DELAY100_OUTER
-
-    ret
-
-
-;=========================================================
-;=========================================================
-; 20 ms DELAY
-;
-;=========================================================
-
-DELAY_20MS:
-
-    ldi r20, 2
-
-
-DELAY20_OUTER:
-
-    ldi r21, 200
-
-
-DELAY20_MIDDLE:
-
-    ldi r22, 250
-
-
-DELAY20_INNER:
-
-    dec r22
-    brne DELAY20_INNER
-
-    dec r21
-    brne DELAY20_MIDDLE
-
-    dec r20
-    brne DELAY20_OUTER
 
     ret
 
